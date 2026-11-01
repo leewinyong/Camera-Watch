@@ -1,0 +1,371 @@
+name: cam-watch
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cam-watch
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install requests cryptography
+      - name: check cameras
+        env:
+          MI_USER: ${{ secrets.MI_USER }}
+          LINE_TOKEN: ${{ secrets.LINE_TOKEN }}
+          LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
+        run: |
+          python - <<'PY'
+          import base64, hashlib, json, os, time, datetime, requests
+          from cryptography.fernet import Fernet
+
+          TZ = datetime.timezone(datetime.timedelta(hours=7))
+          STATE_FILE = "state.json"
+          SERVERS = ["sg", "cn", "de", "us", "i2", "ru"]
+          SEED = hashlib.sha256((os.environ.get("MI_USER", "") + "|" + os.environ["LINE_TOKEN"]).encode()).digest()
+          FERNET = Fernet(base64.urlsafe_b64encode(SEED))
+          AGENT = "Android-7.1.1-1.0.0-ONEPLUS A3010-136-" + hashlib.md5(SEED).hexdigest()[:13].upper() \
+                  + " APP/xiaomi.smarthome APPV/62830"
+          MANUAL = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+
+
+          class AuthError(Exception):
+              pass
+
+
+          def now():
+              return datetime.datetime.now(TZ).strftime("%d/%m %H:%M")
+
+
+          def line(msg):
+              try:
+                  r = requests.post(
+                      "https://api.line.me/v2/bot/message/push",
+                      headers={"Authorization": "Bearer " + os.environ["LINE_TOKEN"].strip()},
+                      json={"to": os.environ["LINE_USER_ID"].strip(),
+                            "messages": [{"type": "text", "text": msg}]},
+                      timeout=20)
+                  print("LINE:", r.status_code, r.text[:200])
+              except Exception as e:
+                  print("LINE error:", e)
+
+
+          def load():
+              try:
+                  with open(STATE_FILE) as f:
+                      return json.load(f)
+              except Exception:
+                  return {}
+
+
+          def save(s):
+              s["date"] = datetime.datetime.now(TZ).strftime("%Y-%m-%d")
+              with open(STATE_FILE, "w") as f:
+                  json.dump(s, f, ensure_ascii=False, indent=1, sort_keys=True)
+
+
+          def parse(text):
+              return json.loads(text.replace("&&&START&&&", ""))
+
+
+          # ---------- เข้ารหัสแบบที่แอป Mi Home ใช้ ----------
+          def rc4(key, data):
+              S, j = list(range(256)), 0
+              for i in range(256):
+                  j = (j + S[i] + key[i % len(key)]) % 256
+                  S[i], S[j] = S[j], S[i]
+              i = j = 0
+              out = bytearray()
+              for n, b in enumerate(bytes(1024) + data):
+                  i = (i + 1) % 256
+                  j = (j + S[i]) % 256
+                  S[i], S[j] = S[j], S[i]
+                  if n >= 1024:
+                      out.append(b ^ S[(S[i] + S[j]) % 256])
+              return bytes(out)
+
+
+          def sign(path, form, signed_nonce):
+              parts = ["POST", path] + [k + "=" + v for k, v in form.items()]
+              parts.append(base64.b64encode(signed_nonce).decode())
+              return base64.b64encode(hashlib.sha1("&".join(parts).encode()).digest()).decode()
+
+
+          def api(auth, server, path, payload):
+              ssec = base64.b64decode(auth["ssecurity"])
+              nonce = os.urandom(8) + int(time.time() / 60).to_bytes(4, "big")
+              sn = hashlib.sha256(ssec + nonce).digest()
+              form = {"data": json.dumps(payload, separators=(",", ":"))}
+              form["rc4_hash__"] = sign(path, form, sn)
+              for k, v in form.items():
+                  form[k] = base64.b64encode(rc4(sn, v.encode())).decode()
+              form["signature"] = sign(path, form, sn)
+              form["_nonce"] = base64.b64encode(nonce).decode()
+              host = "https://api.io.mi.com/app" if server == "cn" else "https://" + server + ".api.io.mi.com/app"
+              r = requests.post(host + path, data=form, timeout=20, headers={
+                  "User-Agent": AGENT, "x-xiaomi-protocal-flag-cli": "PROTOCAL-HTTP2",
+                  "MIOT-ENCRYPT-ALGORITHM": "ENCRYPT-RC4", "Accept-Encoding": "identity"},
+                  cookies={"userId": auth["userId"], "serviceToken": auth["serviceToken"],
+                           "yetAnotherServiceToken": auth["serviceToken"], "locale": "en_US",
+                           "timezone": "GMT+07:00", "channel": "MI_APP_STORE"})
+              if r.status_code in (401, 403):
+                  raise AuthError("http " + str(r.status_code))
+              if r.status_code != 200:
+                  raise Exception("http " + str(r.status_code))
+              res = json.loads(rc4(sn, base64.b64decode(r.text)))
+              if res.get("code") != 0:
+                  raise Exception("code " + str(res.get("code")) + " " + str(res.get("message")))
+              return res["result"]
+
+
+          def try_api(auth, server, path, payload):
+              try:
+                  return api(auth, server, path, payload) or {}
+              except AuthError:
+                  raise
+              except Exception as e:
+                  print(server, path, "failed:", repr(e)[:150])
+                  return {}
+
+
+          def device_list(auth, server):
+              """รวมอุปกรณ์จากทุกบ้าน รวมถึงบ้านที่คนอื่นแชร์ให้"""
+              devs = {}
+              q = {"getVirtualModel": True, "getHuamiDevices": 1, "get_split_device": False,
+                   "support_smart_home": True}
+              for path in ("/v2/home/device_list_page", "/home/device_list"):
+                  for d in try_api(auth, server, path, q).get("list") or []:
+                      devs[d["did"]] = d
+              homes = [(h["id"], auth["userId"]) for h in try_api(auth, server, "/v2/homeroom/gethome", {
+                  "fg": True, "fetch_share": True, "fetch_share_dev": True, "limit": 300, "app_ver": 7
+              }).get("homelist") or []]
+              share = try_api(auth, server, "/v2/user/get_device_cnt", {"fetch_own": True, "fetch_share": True})
+              homes += [(h["home_id"], h["home_owner"]) for h in (share.get("share") or {}).get("share_family") or []]
+              for hid, owner in homes:
+                  res = try_api(auth, server, "/v2/home/home_device_list", {
+                      "home_owner": int(owner), "home_id": int(hid), "limit": 200,
+                      "get_split_device": True, "support_smart_home": True})
+                  for d in res.get("device_info") or []:
+                      devs.setdefault(d["did"], d)
+              return list(devs.values())
+
+
+          def is_cam(d):
+              filt = os.environ.get("CAMERA_FILTER", "").strip().lower()
+              name, model = d.get("name", ""), d.get("model", "").lower()
+              if filt:
+                  return filt in name.lower()
+              return "camera" in model or ".cam" in model or "กล้อง" in name or "camera" in name.lower()
+
+
+          # ---------- ล็อกอิน ----------
+          def finish(ss, data):
+              r = ss.get(data["location"], timeout=20)
+              token = r.cookies.get("serviceToken")
+              if not token:
+                  for c in ss.cookies:
+                      if c.name == "serviceToken":
+                          token = c.value
+              if not token:
+                  raise Exception("no serviceToken")
+              return {"userId": str(data["userId"]), "ssecurity": data["ssecurity"],
+                      "passToken": data.get("passToken") or "", "serviceToken": token}
+
+
+          def token_login(auth):
+              """ต่ออายุการเข้าระบบด้วย passToken ที่เก็บไว้ ไม่ต้องยืนยันตัวตนใหม่"""
+              if not auth.get("passToken"):
+                  raise AuthError("no passToken")
+              ss = requests.Session()
+              ss.headers["User-Agent"] = AGENT
+              r = ss.get("https://account.xiaomi.com/pass/serviceLogin",
+                         params={"_json": "true", "sid": "xiaomiio"},
+                         cookies={"userId": auth["userId"], "passToken": auth["passToken"]}, timeout=20)
+              data = parse(r.text)
+              if not data.get("ssecurity") or not data.get("location"):
+                  raise AuthError("passToken expired: " + str(data.get("code")))
+              data.setdefault("passToken", auth["passToken"])
+              data.setdefault("userId", auth["userId"])
+              return finish(ss, data)
+
+
+          def qr_login(s):
+              """ส่งลิงก์ทาง LINE ให้กดอนุญาต แล้วรอผล"""
+              last = s.get("qr_sent", 0)
+              if not MANUAL and time.time() - last < 3 * 3600:
+                  print("QR link sent recently, skip")
+                  return None
+              ss = requests.Session()
+              ss.headers["User-Agent"] = AGENT
+              r = ss.get("https://account.xiaomi.com/longPolling/loginUrl", timeout=20, params={
+                  "_qrsize": "480", "qs": "%3Fsid%3Dxiaomiio%26_json%3Dtrue",
+                  "callback": "https://sts.api.io.mi.com/sts", "_hasLogo": "false", "sid": "xiaomiio",
+                  "serviceParam": "", "_locale": "th_TH", "_dc": str(int(time.time() * 1000))})
+              j = parse(r.text)
+              wait = min(int(j.get("timeout", 300)), 480)
+              line("🔐 กดลิงก์นี้เพื่ออนุญาตให้บอทเข้าบัญชี Xiaomi (ภายใน " + str(wait // 60) + " นาที)\n"
+                   "ล็อกอินด้วยบัญชีเดียวกับแอป Mi Home แล้วกดยืนยัน:\n" + j["loginUrl"])
+              s["qr_sent"] = time.time()
+              end = time.time() + wait
+              while time.time() < end:
+                  try:
+                      r = ss.get(j["lp"], timeout=15)
+                  except requests.exceptions.RequestException:
+                      continue
+                  if r.status_code == 200:
+                      data = parse(r.text)
+                      if data.get("ssecurity") and data.get("location"):
+                          auth = finish(ss, data)
+                          line("✅ อนุญาตสำเร็จ บอทเข้าบัญชี Xiaomi ได้แล้ว")
+                          return auth
+                      print("lp response:", str(data)[:200])
+                  time.sleep(2)
+              line("⌛ ลิงก์หมดเวลาแล้ว กด Run workflow ใน GitHub เพื่อขอลิงก์ใหม่ได้")
+              return None
+
+
+          def get_cams(auth, server):
+              devs = device_list(auth, server)
+              cams = {d["did"]: {"name": d.get("name", ""), "online": bool(d.get("isOnline"))}
+                      for d in devs if is_cam(d)}
+              return devs, cams
+
+
+          def fetch(auth, s):
+              server = os.environ.get("MI_SERVER", "").strip() or s.get("server")
+              found = {}
+              for sv in ([server] if server else SERVERS):
+                  devs, cams = get_cams(auth, sv)
+                  if cams:
+                      return sv, cams, found
+                  if devs:
+                      found[sv] = devs
+              return None, {}, found
+
+
+          def main():
+              s = load()
+              auth = None
+              if s.get("auth"):
+                  try:
+                      auth = json.loads(FERNET.decrypt(s["auth"].encode()))
+                  except Exception:
+                      auth = None
+
+              result = None
+              for step in ("saved", "refresh", "qr"):
+                  try:
+                      if step == "refresh":
+                          if not auth:
+                              continue
+                          auth = token_login(auth)
+                      elif step == "qr":
+                          auth = qr_login(s)
+                          if not auth:
+                              break
+                      elif not auth:
+                          continue
+                      result = fetch(auth, s)
+                      break
+                  except AuthError as e:
+                      print(step, "auth error:", e)
+                  except Exception as e:  # เน็ตหรือเซิร์ฟเวอร์มีปัญหา ไม่ใช่เรื่องสิทธิ์ ไม่ต้องขอลิงก์ใหม่
+                      print(step, "error:", repr(e)[:300])
+                      if step == "qr":
+                          line("⚠️ ขอลิงก์เข้าระบบ Xiaomi ไม่สำเร็จ: " + repr(e)[:150])
+                      break
+
+              if result is None:
+                  if s.get("login_ok", True):
+                      line("⚠️ บอทเข้าบัญชี Xiaomi ไม่ได้ (" + now() + ") ตอนนี้จะไม่รู้สถานะกล้อง")
+                  s["login_ok"] = False
+                  save(s)
+                  return
+
+              new_auth = FERNET.encrypt(json.dumps(auth).encode()).decode()
+              try:
+                  same = s.get("auth") and json.loads(FERNET.decrypt(s["auth"].encode())) == auth
+              except Exception:
+                  same = False
+              if not same:
+                  s["auth"] = new_auth
+              if s.get("login_ok") is False:
+                  line("✅ บอทกลับมาเฝ้ากล้องตามปกติแล้ว")
+              s["login_ok"] = True
+
+              server, cams, found = result
+              if not cams:
+                  if MANUAL or not s.get("no_cam_warned"):
+                      if found:
+                          lines = ["⚠️ เข้าบัญชีได้ แต่ไม่พบกล้อง อุปกรณ์ที่เจอ:"]
+                          for sv, devs in found.items():
+                              for d in devs[:15]:
+                                  lines.append("• " + d.get("name", "?") + " (" + d.get("model", "?") + ") [" + sv + "]")
+                          line("\n".join(lines))
+                      else:
+                          line("⚠️ เข้าบัญชี Xiaomi ได้ แต่ไม่พบอุปกรณ์เลยสักชิ้น\n"
+                               "บัญชีที่กดอนุญาตอาจไม่ใช่บัญชีเดียวกับที่ใช้ในแอป Mi Home "
+                               "(ดูได้ที่แอป Mi Home → โปรไฟล์)")
+                      s["no_cam_warned"] = True
+                  save(s)
+                  return
+              s["server"] = server
+              s.pop("no_cam_warned", None)
+
+              # ถ้าเห็นกล้องออฟไลน์ ให้รอ 2 นาทีแล้วเช็กซ้ำ กันแจ้งเตือนหลอก
+              old = s.get("cams", {})
+              if any(not c["online"] and old.get(d, {}).get("online", True) for d, c in cams.items()):
+                  time.sleep(120)
+                  try:
+                      _, again = get_cams(auth, server)
+                      for d, c in again.items():
+                          if c["online"] and d in cams:
+                              cams[d]["online"] = True
+                  except Exception as e:
+                      print("recheck failed:", e)
+
+              if not old:
+                  lines = ["🤖 บอทเฝ้ากล้องเริ่มทำงานแล้ว (" + now() + ")"]
+                  for c in cams.values():
+                      lines.append(("🟢 " if c["online"] else "🔴 ") + c["name"]
+                                   + (" ออนไลน์" if c["online"] else " ออฟไลน์"))
+                  line("\n".join(lines))
+              else:
+                  for d, c in cams.items():
+                      was = old.get(d, {}).get("online", True)
+                      if was and not c["online"]:
+                          line("🔴 กล้องดับ: " + c["name"] + "\nตรวจพบเวลา " + now())
+                      elif not was and c["online"]:
+                          line("🟢 กล้องกลับมาออนไลน์: " + c["name"] + "\nเวลา " + now())
+
+              s["cams"] = {d: {"online": c["online"]} for d, c in cams.items()}
+              save(s)
+
+
+          if __name__ == "__main__":
+              main()
+          PY
+      - name: save state
+        if: always()
+        run: |
+          if [ -n "$(git status --porcelain state.json)" ]; then
+            git config user.name "cam-bot"
+            git config user.email "cam-bot@users.noreply.github.com"
+            git add state.json
+            git commit -m "update state"
+            git push
+          fi
