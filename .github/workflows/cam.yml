@@ -1,0 +1,157 @@
+name: cam-watch
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cam-watch
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install micloud==0.6 requests
+      - name: check cameras
+        env:
+          MI_USER: ${{ secrets.MI_USER }}
+          MI_PASS: ${{ secrets.MI_PASS }}
+          LINE_TOKEN: ${{ secrets.LINE_TOKEN }}
+          LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
+        run: |
+          python - <<'PY'
+          import json, os, time, datetime, requests
+          from micloud import MiCloud
+
+          TZ = datetime.timezone(datetime.timedelta(hours=7))
+          STATE_FILE = "state.json"
+          SERVERS = ["sg", "cn", "de", "us", "i2", "ru", "tw"]
+
+
+          def now():
+              return datetime.datetime.now(TZ).strftime("%d/%m %H:%M")
+
+
+          def line(msg):
+              try:
+                  r = requests.post(
+                      "https://api.line.me/v2/bot/message/push",
+                      headers={"Authorization": "Bearer " + os.environ["LINE_TOKEN"].strip()},
+                      json={"to": os.environ["LINE_USER_ID"].strip(),
+                            "messages": [{"type": "text", "text": msg}]},
+                      timeout=20)
+                  print("LINE:", r.status_code, r.text[:200])
+              except Exception as e:
+                  print("LINE error:", e)
+
+
+          def load():
+              try:
+                  with open(STATE_FILE) as f:
+                      return json.load(f)
+              except Exception:
+                  return {}
+
+
+          def save(s):
+              s["date"] = datetime.datetime.now(TZ).strftime("%Y-%m-%d")
+              with open(STATE_FILE, "w") as f:
+                  json.dump(s, f, ensure_ascii=False, indent=1, sort_keys=True)
+
+
+          def get_cams(mc, server):
+              devs = mc.get_devices(country=server) or []
+              filt = os.environ.get("CAMERA_FILTER", "").strip().lower()
+              cams = {}
+              for d in devs:
+                  name, model = d.get("name", ""), d.get("model", "")
+                  if (filt and filt in name.lower()) or (not filt and "camera" in model):
+                      cams[d["did"]] = {"name": name, "online": bool(d.get("isOnline"))}
+              return devs, cams
+
+
+          def main():
+              s = load()
+              mc = MiCloud(os.environ["MI_USER"].strip(), os.environ["MI_PASS"])
+              try:
+                  ok = mc.login()
+              except Exception as e:
+                  print("login error:", e)
+                  ok = False
+              if not ok:
+                  if s.get("login_ok", True):
+                      line("⚠️ บอทล็อกอิน Xiaomi ไม่ได้ (" + now() + ")\n"
+                           "ตอนนี้จะไม่รู้สถานะกล้อง ลองเปิดแอป Mi Home ดูว่ามีการขอยืนยันตัวตน "
+                           "หรือเช็กอีเมล/รหัสผ่านใน GitHub Secrets")
+                      s["login_ok"] = False
+                  save(s)
+                  return
+              if s.get("login_ok") is False:
+                  line("✅ บอทล็อกอิน Xiaomi ได้แล้ว กลับมาเฝ้ากล้องตามปกติ")
+              s["login_ok"] = True
+
+              server = os.environ.get("MI_SERVER", "").strip() or s.get("server")
+              cams = {}
+              for sv in ([server] if server else SERVERS):
+                  devs, cams = get_cams(mc, sv)
+                  if devs:
+                      server = sv
+                      break
+              if not cams:
+                  if not s.get("no_cam_warned"):
+                      line("⚠️ บอทเข้าบัญชี Xiaomi ได้ แต่ไม่พบกล้องในบัญชีนี้")
+                      s["no_cam_warned"] = True
+                  save(s)
+                  return
+              s["server"] = server
+              s.pop("no_cam_warned", None)
+
+              # ถ้าเห็นกล้องออฟไลน์ ให้รอ 2 นาทีแล้วเช็กซ้ำ กันแจ้งเตือนหลอก
+              old = s.get("cams", {})
+              if any(not c["online"] and old.get(d, {}).get("online", True)
+                     for d, c in cams.items()):
+                  time.sleep(120)
+                  _, again = get_cams(mc, server)
+                  for d, c in again.items():
+                      if c["online"] and d in cams:
+                          cams[d]["online"] = True
+
+              if not old:
+                  lines = ["🤖 บอทเฝ้ากล้องเริ่มทำงานแล้ว (" + now() + ")"]
+                  for c in cams.values():
+                      lines.append(("🟢 " if c["online"] else "🔴 ") + c["name"]
+                                   + (" ออนไลน์" if c["online"] else " ออฟไลน์"))
+                  line("\n".join(lines))
+              else:
+                  for d, c in cams.items():
+                      was = old.get(d, {}).get("online", True)
+                      if was and not c["online"]:
+                          line("🔴 กล้องดับ: " + c["name"] + "\nตรวจพบเวลา " + now())
+                      elif not was and c["online"]:
+                          line("🟢 กล้องกลับมาออนไลน์: " + c["name"] + "\nเวลา " + now())
+
+              s["cams"] = {d: {"online": c["online"]} for d, c in cams.items()}
+              save(s)
+
+
+          if __name__ == "__main__":
+              main()
+          PY
+      - name: save state
+        run: |
+          if [ -n "$(git status --porcelain state.json)" ]; then
+            git config user.name "cam-bot"
+            git config user.email "cam-bot@users.noreply.github.com"
+            git add state.json
+            git commit -m "update state"
+            git push
+          fi
