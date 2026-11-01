@@ -14,13 +14,15 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 12
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - run: pip install micloud==0.6 requests
+      - run: pip install micloud==0.6 requests cryptography
       - name: check cameras
         env:
           MI_USER: ${{ secrets.MI_USER }}
@@ -29,12 +31,18 @@ jobs:
           LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
         run: |
           python - <<'PY'
-          import json, os, time, datetime, requests
+          import base64, hashlib, json, os, time, datetime, requests
           from micloud import MiCloud
+          from cryptography.fernet import Fernet
 
           TZ = datetime.timezone(datetime.timedelta(hours=7))
           STATE_FILE = "state.json"
           SERVERS = ["sg", "cn", "de", "us", "i2", "ru", "tw"]
+          USER = os.environ["MI_USER"].strip()
+          PASS = os.environ["MI_PASS"]
+          SEED = hashlib.sha256((USER + "|" + PASS + "|" + os.environ["LINE_TOKEN"]).encode()).digest()
+          FERNET = Fernet(base64.urlsafe_b64encode(SEED))
+          DEVICE_ID = hashlib.md5(SEED).hexdigest()[:16].upper()  # คงที่ทุกรอบ ให้ Xiaomi จำเครื่องได้
 
 
           def now():
@@ -68,8 +76,82 @@ jobs:
                   json.dump(s, f, ensure_ascii=False, indent=1, sort_keys=True)
 
 
+          def parse(text):
+              return json.loads(text.replace("&&&START&&&", ""))
+
+
+          def new_session():
+              ss = requests.Session()
+              ss.headers["User-Agent"] = ("Android-7.1.1-1.0.0-ONEPLUS A3010-136-" + DEVICE_ID
+                                          + " APP/xiaomi.smarthome APPV/62830")
+              for dom in ("mi.com", "xiaomi.com"):
+                  ss.cookies.set("sdkVersion", "accountsdk-18.8.15", domain=dom)
+                  ss.cookies.set("deviceId", DEVICE_ID, domain=dom)
+              return ss
+
+
+          def login_once(ss):
+              """คืนค่า (สถานะ, ข้อมูล): ok / verify / captcha / badpass / fail"""
+              r1 = ss.get("https://account.xiaomi.com/pass/serviceLogin?sid=xiaomiio&_json=true",
+                          cookies={"userId": USER}, timeout=20)
+              j1 = parse(r1.text)
+              if j1.get("ssecurity") and j1.get("location"):
+                  j2 = j1
+              else:
+                  r2 = ss.post("https://account.xiaomi.com/pass/serviceLoginAuth2", timeout=20, data={
+                      "sid": "xiaomiio", "_json": "true", "user": USER, "_sign": j1.get("_sign", ""),
+                      "hash": hashlib.md5(PASS.encode()).hexdigest().upper(),
+                      "callback": "https://sts.api.io.mi.com/sts",
+                      "qs": "%3Fsid%3Dxiaomiio%26_json%3Dtrue"})
+                  j2 = parse(r2.text)
+              print("login step2:", {k: j2.get(k) for k in ("result", "code", "desc", "securityStatus")})
+              if not j2.get("ssecurity") or not j2.get("location"):
+                  if j2.get("notificationUrl"):
+                      return "verify", j2["notificationUrl"]
+                  if j2.get("captchaUrl"):
+                      return "captcha", None
+                  if j2.get("code") == 70016:
+                      return "badpass", None
+                  return "fail", str(j2.get("code")) + " " + str(j2.get("desc", ""))
+              r3 = ss.get(j2["location"], timeout=20)
+              token = r3.cookies.get("serviceToken") or ss.cookies.get("serviceToken")
+              if not token:
+                  return "fail", "no serviceToken"
+              return "ok", {"userId": str(j2["userId"]), "ssecurity": j2["ssecurity"], "serviceToken": token}
+
+
+          def login(s):
+              ss = new_session()
+              st, info = login_once(ss)
+              if st == "verify":
+                  last = s.get("verify_sent", 0)
+                  if time.time() - last > 3 * 3600:
+                      line("🔐 Xiaomi ขอยืนยันตัวตนก่อนให้บอทเข้าระบบ\n"
+                           "กดลิงก์นี้ภายใน 7 นาที แล้วทำตามขั้นตอน (รับรหัสทาง SMS/อีเมล):\n" + info)
+                      s["verify_sent"] = time.time()
+                      # รอให้ผู้ใช้ยืนยัน แล้วลองล็อกอินซ้ำจากเครื่องเดิม
+                      for _ in range(14):
+                          time.sleep(30)
+                          st, info2 = login_once(ss)
+                          if st == "ok":
+                              info = info2
+                              line("✅ ยืนยันตัวตนสำเร็จ บอทเข้าระบบ Xiaomi ได้แล้ว")
+                              break
+                  else:
+                      print("verify needed, link already sent recently")
+              return st, info
+
+
+          def make_mc(auth):
+              mc = MiCloud(USER, PASS)
+              mc.user_id, mc.ssecurity, mc.service_token = auth["userId"], auth["ssecurity"], auth["serviceToken"]
+              return mc
+
+
           def get_cams(mc, server):
-              devs = mc.get_devices(country=server) or []
+              devs = mc.get_devices(country=server)
+              if devs is None:
+                  return None, {}
               filt = os.environ.get("CAMERA_FILTER", "").strip().lower()
               cams = {}
               for d in devs:
@@ -79,33 +161,63 @@ jobs:
               return devs, cams
 
 
-          def main():
-              s = load()
-              mc = MiCloud(os.environ["MI_USER"].strip(), os.environ["MI_PASS"])
-              try:
-                  ok = mc.login()
-              except Exception as e:
-                  print("login error:", e)
-                  ok = False
-              if not ok:
-                  if s.get("login_ok", True):
-                      line("⚠️ บอทล็อกอิน Xiaomi ไม่ได้ (" + now() + ")\n"
-                           "ตอนนี้จะไม่รู้สถานะกล้อง ลองเปิดแอป Mi Home ดูว่ามีการขอยืนยันตัวตน "
-                           "หรือเช็กอีเมล/รหัสผ่านใน GitHub Secrets")
-                      s["login_ok"] = False
-                  save(s)
-                  return
-              if s.get("login_ok") is False:
-                  line("✅ บอทล็อกอิน Xiaomi ได้แล้ว กลับมาเฝ้ากล้องตามปกติ")
-              s["login_ok"] = True
-
+          def fetch(mc, s):
               server = os.environ.get("MI_SERVER", "").strip() or s.get("server")
-              cams = {}
+              got = False
               for sv in ([server] if server else SERVERS):
                   devs, cams = get_cams(mc, sv)
+                  if devs is not None:
+                      got = True
                   if devs:
-                      server = sv
-                      break
+                      return True, sv, cams
+              return got, server, {}
+
+
+          def main():
+              s = load()
+              auth = None
+              if s.get("auth"):
+                  try:
+                      auth = json.loads(FERNET.decrypt(s["auth"].encode()))
+                  except Exception:
+                      auth = None
+
+              ok, server, cams = (False, None, {})
+              if auth:
+                  ok, server, cams = fetch(make_mc(auth), s)
+              if not ok:  # ยังไม่เคยล็อกอิน หรือ token หมดอายุ
+                  try:
+                      st, info = login(s)
+                  except Exception as e:
+                      st, info = "fail", repr(e)[:150]
+                  if st != "ok":
+                      reasons = {
+                          "verify": "Xiaomi ขอยืนยันตัวตน (ส่งลิงก์ให้แล้ว ถ้ากดไม่ทันจะส่งใหม่ภายใน 3 ชม.)",
+                          "captcha": "Xiaomi ขอให้กรอก captcha ลองล็อกอินแอป Mi Home ใหม่แล้วรอสักพัก",
+                          "badpass": "อีเมล/รหัสผ่าน Xiaomi ไม่ถูกต้อง เช็ก MI_USER และ MI_PASS ใน GitHub Secrets",
+                          "fail": "ข้อผิดพลาดอื่น: " + str(info),
+                      }
+                      print("login failed:", st, info)
+                      if s.get("login_ok", True) or s.get("last_reason") != st:
+                          if st != "verify":
+                              line("⚠️ บอทล็อกอิน Xiaomi ไม่ได้ (" + now() + ")\nสาเหตุ: " + reasons[st])
+                          s["login_ok"] = False
+                          s["last_reason"] = st
+                      save(s)
+                      return
+                  auth = info
+                  s["auth"] = FERNET.encrypt(json.dumps(auth).encode()).decode()
+                  ok, server, cams = fetch(make_mc(auth), s)
+                  if not ok:
+                      line("⚠️ ล็อกอินได้ แต่ดึงรายการอุปกรณ์ไม่ได้ (" + now() + ")")
+                      save(s)
+                      return
+
+              if s.get("login_ok") is False:
+                  line("✅ บอทเข้าระบบ Xiaomi ได้แล้ว กลับมาเฝ้ากล้องตามปกติ")
+              s["login_ok"] = True
+              s.pop("last_reason", None)
+
               if not cams:
                   if not s.get("no_cam_warned"):
                       line("⚠️ บอทเข้าบัญชี Xiaomi ได้ แต่ไม่พบกล้องในบัญชีนี้")
@@ -117,10 +229,9 @@ jobs:
 
               # ถ้าเห็นกล้องออฟไลน์ ให้รอ 2 นาทีแล้วเช็กซ้ำ กันแจ้งเตือนหลอก
               old = s.get("cams", {})
-              if any(not c["online"] and old.get(d, {}).get("online", True)
-                     for d, c in cams.items()):
+              if any(not c["online"] and old.get(d, {}).get("online", True) for d, c in cams.items()):
                   time.sleep(120)
-                  _, again = get_cams(mc, server)
+                  _, again = get_cams(make_mc(auth), server)
                   for d, c in again.items():
                       if c["online"] and d in cams:
                           cams[d]["online"] = True
@@ -147,6 +258,7 @@ jobs:
               main()
           PY
       - name: save state
+        if: always()
         run: |
           if [ -n "$(git status --porcelain state.json)" ]; then
             git config user.name "cam-bot"
