@@ -1,4 +1,6 @@
 {
  "date": "2026-11-02",
- "login_ok": false
+ "last_reason": "verify",
+ "login_ok": false,
+ "verify_sent": 1793553859.4044795
 }
