@@ -64,11 +64,11 @@ jobs:
 
           def line(msg):
               try:
+                  # broadcast = ส่งหาทุกคนที่แอดบัญชี LINE OA นี้เป็นเพื่อน
                   r = requests.post(
-                      "https://api.line.me/v2/bot/message/push",
+                      "https://api.line.me/v2/bot/message/broadcast",
                       headers={"Authorization": "Bearer " + os.environ["LINE_TOKEN"].strip()},
-                      json={"to": os.environ["LINE_USER_ID"].strip(),
-                            "messages": [{"type": "text", "text": msg}]},
+                      json={"messages": [{"type": "text", "text": msg}]},
                       timeout=20)
                   print("LINE:", r.status_code, r.text[:200])
                   if r.status_code == 200:
