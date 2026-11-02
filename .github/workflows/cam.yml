@@ -2,7 +2,7 @@ name: cam-watch
 
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -30,14 +30,17 @@ jobs:
           LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
         run: |
           python - <<'PY'
-          import base64, hashlib, json, os, time, datetime, requests
-          from cryptography.fernet import Fernet
+          import base64, hashlib, json, os, sys, time, datetime, requests
+          from cryptography.fernet import Fernet, MultiFernet
 
           TZ = datetime.timezone(datetime.timedelta(hours=7))
           STATE_FILE = "state.json"
           SERVERS = ["sg", "cn", "de", "us", "i2", "ru"]
-          SEED = hashlib.sha256((os.environ.get("MI_USER", "") + "|" + os.environ["LINE_TOKEN"]).encode()).digest()
-          FERNET = Fernet(base64.urlsafe_b64encode(SEED))
+          # กุญแจเข้ารหัสการล็อกอินที่เก็บไว้ (ไม่ผูกกับ LINE_TOKEN แล้ว เปลี่ยน token ได้โดยไม่ต้องกดลิงก์ใหม่)
+          SEED = hashlib.sha256((os.environ.get("MI_USER", "") + "|" + os.environ["LINE_USER_ID"].strip()).encode()).digest()
+          OLD_SEED = hashlib.sha256((os.environ.get("MI_USER", "") + "|" + os.environ["LINE_TOKEN"]).encode()).digest()
+          KEY = Fernet(base64.urlsafe_b64encode(SEED))
+          FERNET = MultiFernet([KEY, Fernet(base64.urlsafe_b64encode(OLD_SEED))])
           AGENT = "Android-7.1.1-1.0.0-ONEPLUS A3010-136-" + hashlib.md5(SEED).hexdigest()[:13].upper() \
                   + " APP/xiaomi.smarthome APPV/62830"
           MANUAL = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
@@ -60,8 +63,12 @@ jobs:
                             "messages": [{"type": "text", "text": msg}]},
                       timeout=20)
                   print("LINE:", r.status_code, r.text[:200])
+                  if r.status_code == 200:
+                      return True
+                  print("::error::LINE ส่งไม่สำเร็จ " + str(r.status_code) + " " + r.text[:200])
               except Exception as e:
-                  print("LINE error:", e)
+                  print("::error::LINE error: " + repr(e)[:200])
+              return False
 
 
           def load():
@@ -298,7 +305,7 @@ jobs:
 
               new_auth = FERNET.encrypt(json.dumps(auth).encode()).decode()
               try:
-                  same = s.get("auth") and json.loads(FERNET.decrypt(s["auth"].encode())) == auth
+                  same = s.get("auth") and json.loads(KEY.decrypt(s["auth"].encode())) == auth
               except Exception:
                   same = False
               if not same:
@@ -343,8 +350,9 @@ jobs:
                   for c in cams.values():
                       lines.append(("🟢 " if c["online"] else "🔴 ") + c["name"]
                                    + (" ออนไลน์" if c["online"] else " ออฟไลน์"))
-                  line("\n".join(lines))
+                  sent = line("\n".join(lines))
               else:
+                  sent = True
                   down = [c["name"] for d, c in cams.items()
                           if old.get(d, {}).get("online", True) and not c["online"]]
                   up = [c["name"] for d, c in cams.items()
@@ -358,8 +366,12 @@ jobs:
                       still = [c["name"] for c in cams.values() if not c["online"] and c["name"] not in down]
                       if still and up:
                           parts.append("ยังดับอยู่: " + ", ".join(still))
-                      line("\n".join(parts) + "\nเวลา " + now())
+                      sent = line("\n".join(parts) + "\nเวลา " + now())
 
+              if not sent:
+                  # ส่ง LINE ไม่สำเร็จ: ไม่บันทึกสถานะใหม่ รอบหน้าจะลองส่งซ้ำ และให้ GitHub ขึ้นกากบาทแดง
+                  save(s)
+                  sys.exit(1)
               s["cams"] = {d: {"online": c["online"]} for d, c in cams.items()}
               save(s)
 
