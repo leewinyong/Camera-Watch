@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "*/5 * * * *"
   workflow_dispatch:
+    inputs:
+      source:
+        description: "ผู้สั่งรัน"
+        required: false
+        default: "manual"
 
 permissions:
   contents: write
@@ -28,6 +33,7 @@ jobs:
           MI_USER: ${{ secrets.MI_USER }}
           LINE_TOKEN: ${{ secrets.LINE_TOKEN }}
           LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
+          RUN_SOURCE: ${{ inputs.source }}
         run: |
           python - <<'PY'
           import base64, hashlib, json, os, sys, time, datetime, requests
@@ -43,7 +49,9 @@ jobs:
           FERNET = MultiFernet([KEY, Fernet(base64.urlsafe_b64encode(OLD_SEED))])
           AGENT = "Android-7.1.1-1.0.0-ONEPLUS A3010-136-" + hashlib.md5(SEED).hexdigest()[:13].upper() \
                   + " APP/xiaomi.smarthome APPV/62830"
-          MANUAL = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+          # กดรันเองใน GitHub = MANUAL / ถูกเรียกจาก cron-job.org หรือ schedule = ไม่ใช่
+          MANUAL = (os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+                    and os.environ.get("RUN_SOURCE", "manual") != "cron")
 
 
           class AuthError(Exception):
